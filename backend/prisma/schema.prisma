@@ -1,0 +1,124 @@
+// Prisma schema for ReachInbox Email Scheduler
+// Run `npm run prisma:migrate` after setting DATABASE_URL in .env
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum EmailStatus {
+  PENDING     // stored, not yet enqueued
+  SCHEDULED   // enqueued as a BullMQ delayed job
+  PROCESSING  // worker currently sending it
+  SENT
+  FAILED
+  RATE_LIMITED_REQUEUED // hit hourly cap, pushed to next window
+}
+
+model User {
+  id            String   @id @default(uuid())
+  googleId      String?  @unique
+  email         String   @unique
+  name          String?
+  avatarUrl     String?
+  createdAt     DateTime @default(now())
+
+  senders       Sender[]
+  campaigns     Campaign[]
+  slackIntegration SlackIntegration?
+}
+
+// A "sender" is an outbound identity (Ethereal test account) that emails go out from.
+// Rate limiting is enforced per-sender.
+model Sender {
+  id                 String   @id @default(uuid())
+  userId             String
+  user               User     @relation(fields: [userId], references: [id])
+  label              String
+  smtpHost           String
+  smtpPort           Int
+  smtpUser           String
+  smtpPass           String
+  maxEmailsPerHour   Int      @default(200)
+  minDelayMs         Int      @default(2000)
+  createdAt          DateTime @default(now())
+
+  emails             ScheduledEmail[]
+
+  @@index([userId])
+}
+
+// One "compose" action can create many recipient emails (a campaign / batch).
+model Campaign {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  subject     String
+  bodyHtml    String   @db.Text
+  startTime   DateTime
+  delayMs     Int
+  hourlyLimit Int
+  createdAt   DateTime @default(now())
+
+  emails      ScheduledEmail[]
+}
+
+model ScheduledEmail {
+  id            String      @id @default(uuid())
+  campaignId    String
+  campaign      Campaign    @relation(fields: [campaignId], references: [id])
+  senderId      String
+  sender        Sender      @relation(fields: [senderId], references: [id])
+  // Denormalized from campaign.userId - lets us filter Elasticsearch docs
+  // and DB queries by owner without an extra join on every read, and makes
+  // the ES isolation boundary explicit rather than implicit via campaign.
+  userId        String
+
+  recipient     String
+  subject       String
+  bodyHtml      String      @db.Text
+
+  scheduledAt   DateTime    // the time it *should* go out (may be pushed forward by rate limiter)
+  sentAt        DateTime?
+  status        EmailStatus @default(PENDING)
+
+  // BullMQ job id - lets us map DB rows <-> queue jobs and guarantees idempotency
+  // (a job is only ever enqueued once with this id; re-enqueue attempts are no-ops)
+  bullJobId     String?     @unique
+
+  attempts      Int         @default(0)
+  lastError     String?
+
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@index([status])
+  @@index([campaignId])
+  @@index([senderId])
+  @@index([scheduledAt])
+  @@index([userId])
+}
+
+model SlackIntegration {
+  id            String   @id @default(uuid())
+  userId        String   @unique
+  user          User     @relation(fields: [userId], references: [id])
+  teamName      String?
+  accessToken   String   // bot token (xoxb-...) - used to postMessage
+  webhookUrl    String?  // optional incoming webhook, used if present (simpler call)
+  channelId     String?
+  connectedAt   DateTime @default(now())
+}
+
+// Durable idempotency / dedupe ledger, independent of Redis, so a restart
+// can never result in the same recipient+campaign being sent twice even if
+// the BullMQ job state and DB status somehow disagree.
+model SendLedger {
+  id           String   @id @default(uuid())
+  scheduledEmailId String @unique
+  sentAt       DateTime @default(now())
+}
